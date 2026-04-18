@@ -1,0 +1,163 @@
+{
+  "Comment": "Business Passport pipeline: presign → fan-out → synthesize → score → passport → notify",
+  "StartAt": "PresignURLs",
+  "States": {
+    "PresignURLs": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PresignFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": { "result.$": "$.Payload" },
+      "ResultPath": "$.presigned",
+      "Next": "FanOut",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "MarkFailed" }]
+    },
+
+    "FanOut": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "Comment": "Branch A: Audio transcription via GCP Cloud Run",
+          "StartAt": "Transcribe",
+          "States": {
+            "Transcribe": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${GcpProxyFunctionArn}",
+                "Payload": {
+                  "route": "/transcribe",
+                  "payload": {
+                    "audio_url.$": "$.presigned.result.audio_url"
+                  }
+                }
+              },
+              "ResultSelector": { "transcript_result.$": "$.Payload" },
+              "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 2, "BackoffRate": 2.0 }],
+              "End": true
+            }
+          }
+        },
+        {
+          "Comment": "Branch B: Vision extraction via GCP Cloud Run",
+          "StartAt": "ExtractVision",
+          "States": {
+            "ExtractVision": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${GcpProxyFunctionArn}",
+                "Payload": {
+                  "route": "/extract-vision",
+                  "payload": {
+                    "image_urls.$": "$.presigned.result.image_urls"
+                  }
+                }
+              },
+              "ResultSelector": { "vision_result.$": "$.Payload" },
+              "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 2, "BackoffRate": 2.0 }],
+              "End": true
+            }
+          }
+        },
+        {
+          "Comment": "Branch C: Social media scraping",
+          "StartAt": "Scrape",
+          "States": {
+            "Scrape": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ScrapeFunctionArn}",
+                "Payload": {
+                  "url.$": "$.presigned.result.social_url"
+                }
+              },
+              "ResultSelector": { "scrape_result.$": "$.Payload" },
+              "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 2, "BackoffRate": 2.0 }],
+              "End": true
+            }
+          }
+        }
+      ],
+      "ResultPath": "$.fan_out",
+      "Next": "AggregateResults",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "MarkFailed" }]
+    },
+
+    "AggregateResults": {
+      "Type": "Pass",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "user_contact.$": "$.presigned.result.user_contact",
+        "transcript_result.$": "$.fan_out[0].transcript_result",
+        "vision_result.$": "$.fan_out[1].vision_result",
+        "scrape_result.$": "$.fan_out[2].scrape_result"
+      },
+      "Next": "Synthesize"
+    },
+
+    "Synthesize": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${VertexProxyFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": { "synthesis_result.$": "$.Payload" },
+      "ResultPath": "$.synthesized",
+      "Next": "Score",
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 2, "BackoffRate": 2.0 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "MarkFailed" }]
+    },
+
+    "Score": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ScoreFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": { "score_result.$": "$.Payload" },
+      "ResultPath": "$.scored",
+      "Next": "GeneratePassport",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "MarkFailed" }]
+    },
+
+    "GeneratePassport": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PassportFunctionArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": { "passport_result.$": "$.Payload" },
+      "ResultPath": "$.passport",
+      "Next": "Notify",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "MarkFailed" }]
+    },
+
+    "Notify": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${NotifyFunctionArn}",
+        "Payload.$": "$"
+      },
+      "End": true,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "MarkFailed" }]
+    },
+
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${MarkFailedFunctionArn}",
+        "Payload.$": "$"
+      },
+      "End": true
+    }
+  }
+}
