@@ -68,3 +68,15 @@ coverage/
 .nyc_output/
 .tox/
 .pytest_cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+**/.build/
