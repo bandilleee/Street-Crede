@@ -1,0 +1,235 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Business Passport – serverless pipeline
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Default: business-passport-jobs
+  DynamoDBTable:
+    Type: String
+    Default: business-passport-jobs
+  GcpSaSecretName:
+    Type: String
+    Default: gcp-service-account
+  CloudRunUrl:
+    Type: String
+  VertexProject:
+    Type: String
+  VertexRegion:
+    Type: String
+    Default: us-central1
+  VertexEndpointId:
+    Type: String
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 120
+    MemorySize: 512
+    Handler: handler.handler
+    Environment:
+      Variables:
+        S3_BUCKET: !Ref S3BucketName
+        DYNAMODB_TABLE: !Ref DynamoDBTable
+        SNS_TOPIC_ARN: !Ref NotificationsTopic
+        GCP_SA_SECRET_NAME: !Ref GcpSaSecretName
+        CLOUD_RUN_URL: !Ref CloudRunUrl
+        VERTEX_PROJECT: !Ref VertexProject
+        VERTEX_REGION: !Ref VertexRegion
+        VERTEX_ENDPOINT_ID: !Ref VertexEndpointId
+    Policies:
+      - S3CrudPolicy:
+          BucketName: !Ref S3BucketName
+      - DynamoDBCrudPolicy:
+          TableName: !Ref DynamoDBTable
+      - SNSPublishMessagePolicy:
+          TopicName: !GetAtt NotificationsTopic.TopicName
+      - AWSSecretsManagerGetSecretValuePolicy:
+          SecretArn: !Ref GcpSaSecret
+
+Resources:
+
+  # ── Storage ────────────────────────────────────────────────────────────────
+  PassportBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DynamoDBTable
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+
+  # ── SNS ────────────────────────────────────────────────────────────────────
+  NotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: passport-notifications
+
+  # ── Secrets Manager ────────────────────────────────────────────────────────
+  GcpSaSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Ref GcpSaSecretName
+      Description: GCP service account JSON for Cloud Run + Vertex AI auth
+
+  # ── Lambda Functions ───────────────────────────────────────────────────────
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: passport-ingest
+      CodeUri: aws/lambdas/ingest/
+      Events:
+        ApiSubmit:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PassportApi
+            Method: POST
+            Path: /submit
+
+  PresignFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: passport-presign
+      CodeUri: aws/lambdas/presign/
+
+  GcpProxyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: passport-gcp_proxy
+      CodeUri: aws/lambdas/gcp_proxy/
+
+  ScrapeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: passport-scrape
+      CodeUri: aws/lambdas/scrape/
+
+  VertexProxyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: passport-vertex_proxy
+      CodeUri: aws/lambdas/vertex_proxy/
+
+  ScoreFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: passport-score
+      CodeUri: aws/lambdas/score/
+
+  PassportFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: passport-passport
+      CodeUri: aws/lambdas/passport/
+
+  NotifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: passport-notify
+      CodeUri: aws/lambdas/notify/
+
+  # ── API Gateway (HTTP API) ─────────────────────────────────────────────────
+  PassportApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+
+  # ── Step Functions ─────────────────────────────────────────────────────────
+  PassportStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: passport-pipeline
+      Type: EXPRESS
+      DefinitionUri: statemachine/definition.asl.json
+      DefinitionSubstitutions:
+        PresignFunctionArn: !GetAtt PresignFunction.Arn
+        GcpProxyFunctionArn: !GetAtt GcpProxyFunction.Arn
+        ScrapeFunctionArn: !GetAtt ScrapeFunction.Arn
+        VertexProxyFunctionArn: !GetAtt VertexProxyFunction.Arn
+        ScoreFunctionArn: !GetAtt ScoreFunction.Arn
+        PassportFunctionArn: !GetAtt PassportFunction.Arn
+        NotifyFunctionArn: !GetAtt NotifyFunction.Arn
+        MarkFailedFunctionArn: !GetAtt NotifyFunction.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PresignFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GcpProxyFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ScrapeFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref VertexProxyFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ScoreFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PassportFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref NotifyFunction
+
+  # ── EventBridge: S3 jobs/ → Step Functions ────────────────────────────────
+  S3JobsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: passport-s3-jobs-trigger
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+        detail:
+          bucket:
+            name: [!Ref S3BucketName]
+          object:
+            key:
+              - prefix: jobs/
+      Targets:
+        - Id: PassportStateMachine
+          Arn: !Ref PassportStateMachine
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              job_key: $.detail.object.key
+            InputTemplate: '{"job_id": "<job_key>"}'
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartStateMachine
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref PassportStateMachine
+
+Outputs:
+  ApiGatewayUrl:
+    Value: !Sub "https://${PassportApi}.execute-api.${AWS::Region}.amazonaws.com"
+  StateMachineArn:
+    Value: !Ref PassportStateMachine
+  S3Bucket:
+    Value: !Ref PassportBucket
+  DynamoDBTable:
+    Value: !Ref JobsTable
+  SnsTopicArn:
+    Value: !Ref NotificationsTopic
